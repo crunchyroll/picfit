@@ -1,6 +1,6 @@
 package logger
 
-import "context"
+import "golang.org/x/net/context"
 
 // Logger provides a leveled-logging interface.
 type Logger interface {

@@ -1,7 +1,7 @@
 package config
 
 import (
-	"context"
+	"golang.org/x/net/context"
 )
 
 const key = "config"

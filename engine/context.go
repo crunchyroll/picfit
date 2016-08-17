@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"context"
+	"golang.org/x/net/context"
 )
 
 const key = "engine"

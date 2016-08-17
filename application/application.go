@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"strings"
 
-	"context"
+	"golang.org/x/net/context"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/gin-gonic/gin"
