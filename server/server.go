@@ -110,6 +110,7 @@ func Router(ctx netContext.Context) (*gin.Engine, error) {
 			middleware.URLParser(),
 			middleware.OperationParser(),
 			middleware.RestrictSizes(),
+			middleware.CacheControl(cfg.CacheControl),
 			view,
 		}
 
