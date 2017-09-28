@@ -270,6 +270,11 @@ func ImageFileFromContext(c *gin.Context, async bool, load bool) (*image.ImageFi
 	if stored != "" {
 		l.Infof("Key %s found in kvstore: %s", storeKey, stored)
 
+		noneMatch := c.Request.Header.Get("If-None-Match")
+		if noneMatch == key {
+			return nil, errs.ErrClientHasImage
+		}
+
 		if load {
 			file, err = image.FromStorage(destStorage, stored)
 
@@ -322,6 +327,7 @@ func ImageFileFromContext(c *gin.Context, async bool, load bool) (*image.ImageFi
 	file.Storage = destStorage
 
 	file.Headers["ETag"] = key
+	file.Headers["Cache-Control"] = fmt.Sprintf("max-age=%d", cfg.CacheControl)
 
 	if stored == "" {
 		if async == true {
