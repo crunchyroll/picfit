@@ -327,7 +327,7 @@ func ImageFileFromContext(c *gin.Context, async bool, load bool) (*image.ImageFi
 	file.Storage = destStorage
 
 	file.Headers["ETag"] = key
-	file.Headers["Cache-Control"] = fmt.Sprintf("max-age=%d", cfg.CacheControl)
+	file.Headers["Cache-Control"] = fmt.Sprintf("max-age=%d, s-maxage=%d", cfg.CacheControl, cfg.CacheControl)
 
 	if stored == "" {
 		if async == true {
