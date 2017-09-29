@@ -76,6 +76,7 @@ type Config struct {
 	AllowedHeaders []string `mapstructure:"allowed_headers"`
 	Storage        *Storages
 	KVStore        *KVStore
+	CacheControl   int
 }
 
 // DefaultConfig returns a default config instance
@@ -96,6 +97,7 @@ func DefaultConfig() *Config {
 			Width: DefaultShardWidth,
 			Depth: DefaultShardDepth,
 		},
+		CacheControl: DefaultCacheControlDuration,
 	}
 }
 
@@ -108,6 +110,7 @@ func Load(path string) (*Config, error) {
 	viper.SetDefault("options", defaultConfig.Options)
 	viper.SetDefault("shard", defaultConfig.Shard)
 	viper.SetDefault("port", defaultConfig.Port)
+	viper.SetDefault("cachecontrol", defaultConfig.CacheControl)
 	viper.SetDefault("kvstore", defaultConfig.KVStore)
 	viper.SetEnvPrefix("picfit")
 
@@ -134,6 +137,7 @@ func LoadFromContent(content string) (*Config, error) {
 	viper.SetDefault("options", defaultConfig.Options)
 	viper.SetDefault("shard", defaultConfig.Shard)
 	viper.SetDefault("port", defaultConfig.Port)
+	viper.SetDefault("cachecontrol", defaultConfig.CacheControl)
 	viper.SetDefault("kvstore", defaultConfig.KVStore)
 	viper.SetEnvPrefix("picfit")
 	viper.SetConfigType("json")
