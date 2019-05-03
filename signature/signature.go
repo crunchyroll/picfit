@@ -7,18 +7,27 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
-
-	"github.com/thoas/picfit/util"
 )
 
 var signRegex = regexp.MustCompile("&?sig=[^&]*")
 
 // VerifyParameters encodes map parameters with a key and returns if parameters match signature
-func VerifyParameters(key string, qs map[string]string) bool {
+func VerifyParameters(key string, qs map[string]interface{}) bool {
 	params := url.Values{}
 
-	for k, v := range util.SortMapString(qs) {
-		params.Set(k, v)
+	for k, v := range qs {
+		s, ok := v.(string)
+		if ok {
+			params.Set(k, s)
+			continue
+		}
+
+		l, ok := v.([]string)
+		if ok {
+			for i := range l {
+				params.Add(k, l[i])
+			}
+		}
 	}
 
 	return VerifySign(key, params.Encode())
@@ -37,24 +46,11 @@ func Sign(key string, qs string) string {
 // SignRaw encodes raw query string (not sorted) using a key
 func SignRaw(key string, queryString string) (string, error) {
 	values, err := url.ParseQuery(queryString)
-
 	if err != nil {
 		return "", err
 	}
 
-	qs := url.Values{}
-
-	params := map[string]string{}
-
-	for k, v := range values {
-		params[k] = v[0]
-	}
-
-	for k, v := range util.SortMapString(params) {
-		qs.Set(k, v)
-	}
-
-	return Sign(key, qs.Encode()), nil
+	return Sign(key, values.Encode()), nil
 }
 
 // AppendSign appends the signature to query string

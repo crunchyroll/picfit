@@ -13,20 +13,22 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/pkg/errors"
 )
 
-// http://sentry.readthedocs.org/en/latest/developer/interfaces/index.html#sentry.interfaces.Stacktrace
+// https://docs.getsentry.com/hosted/clientdev/interfaces/#failure-interfaces
 type Stacktrace struct {
 	// Required
 	Frames []*StacktraceFrame `json:"frames"`
 }
 
-func (s *Stacktrace) Class() string { return "sentry.interfaces.Stacktrace" }
+func (s *Stacktrace) Class() string { return "stacktrace" }
 
 func (s *Stacktrace) Culprit() string {
 	for i := len(s.Frames) - 1; i >= 0; i-- {
 		frame := s.Frames[i]
-		if *frame.InApp == true && frame.Module != "" && frame.Function != "" {
+		if frame.InApp == true && frame.Module != "" && frame.Function != "" {
 			return frame.Module + "." + frame.Function
 		}
 	}
@@ -46,7 +48,38 @@ type StacktraceFrame struct {
 	ContextLine  string   `json:"context_line,omitempty"`
 	PreContext   []string `json:"pre_context,omitempty"`
 	PostContext  []string `json:"post_context,omitempty"`
-	InApp        *bool    `json:"in_app,omitempty"`
+	InApp        bool     `json:"in_app"`
+}
+
+// Try to get stacktrace from err as an interface of github.com/pkg/errors, or else NewStacktrace()
+func GetOrNewStacktrace(err error, skip int, context int, appPackagePrefixes []string) *Stacktrace {
+	stacktracer, errHasStacktrace := err.(interface {
+		StackTrace() errors.StackTrace
+	})
+	if errHasStacktrace {
+		var frames []*StacktraceFrame
+		for _, f := range stacktracer.StackTrace() {
+			pc := uintptr(f) - 1
+			fn := runtime.FuncForPC(pc)
+			var fName string
+			var file string
+			var line int
+			if fn != nil {
+				file, line = fn.FileLine(pc)
+				fName = fn.Name()
+			} else {
+				file = "unknown"
+				fName = "unknown"
+			}
+			frame := NewStacktraceFrame(pc, fName, file, line, context, appPackagePrefixes)
+			if frame != nil {
+				frames = append([]*StacktraceFrame{frame}, frames...)
+			}
+		}
+		return &Stacktrace{Frames: frames}
+	} else {
+		return NewStacktrace(skip+1, context, appPackagePrefixes)
+	}
 }
 
 // Intialize and populate a new stacktrace, skipping skip frames.
@@ -59,12 +92,36 @@ type StacktraceFrame struct {
 // be considered "in app".
 func NewStacktrace(skip int, context int, appPackagePrefixes []string) *Stacktrace {
 	var frames []*StacktraceFrame
-	for i := 1 + skip; ; i++ {
-		pc, file, line, ok := runtime.Caller(i)
-		if !ok {
+
+	callerPcs := make([]uintptr, 100)
+	numCallers := runtime.Callers(skip+2, callerPcs)
+
+	// If there are no callers, the entire stacktrace is nil
+	if numCallers == 0 {
+		return nil
+	}
+
+	callersFrames := runtime.CallersFrames(callerPcs)
+
+	for {
+		fr, more := callersFrames.Next()
+		if fr.Func != nil {
+			frame := NewStacktraceFrame(fr.PC, fr.Function, fr.File, fr.Line, context, appPackagePrefixes)
+			if frame != nil {
+				frames = append(frames, frame)
+			}
+		}
+		if !more {
 			break
 		}
-		frames = append(frames, NewStacktraceFrame(pc, file, line, context, appPackagePrefixes))
+	}
+	// If there are no frames, the entire stacktrace is nil
+	if len(frames) == 0 {
+		return nil
+	}
+	// Optimize the path where there's only 1 frame
+	if len(frames) == 1 {
+		return &Stacktrace{frames}
 	}
 	// Sentry wants the frames with the oldest first, so reverse them
 	for i, j := 0, len(frames)-1; i < j; i, j = i+1, j-1 {
@@ -81,21 +138,28 @@ func NewStacktrace(skip int, context int, appPackagePrefixes []string) *Stacktra
 //
 // appPackagePrefixes is a list of prefixes used to check whether a package should
 // be considered "in app".
-func NewStacktraceFrame(pc uintptr, file string, line, context int, appPackagePrefixes []string) *StacktraceFrame {
-	frame := &StacktraceFrame{AbsolutePath: file, Filename: trimPath(file), Lineno: line, InApp: new(bool)}
-	frame.Module, frame.Function = functionName(pc)
+func NewStacktraceFrame(pc uintptr, fName, file string, line, context int, appPackagePrefixes []string) *StacktraceFrame {
+	frame := &StacktraceFrame{AbsolutePath: file, Filename: trimPath(file), Lineno: line, InApp: false}
+	frame.Module, frame.Function = functionName(fName)
+
+	// `runtime.goexit` is effectively a placeholder that comes from
+	// runtime/asm_amd64.s and is meaningless.
+	if frame.Module == "runtime" && frame.Function == "goexit" {
+		return nil
+	}
+
 	if frame.Module == "main" {
-		*frame.InApp = true
+		frame.InApp = true
 	} else {
 		for _, prefix := range appPackagePrefixes {
 			if strings.HasPrefix(frame.Module, prefix) && !strings.Contains(frame.Module, "vendor") && !strings.Contains(frame.Module, "third_party") {
-				*frame.InApp = true
+				frame.InApp = true
 			}
 		}
 	}
 
 	if context > 0 {
-		contextLines, lineIdx := fileContext(file, line, context)
+		contextLines, lineIdx := sourceCodeLoader.Load(file, line, context)
 		if len(contextLines) > 0 {
 			for i, line := range contextLines {
 				switch {
@@ -109,7 +173,7 @@ func NewStacktraceFrame(pc uintptr, file string, line, context int, appPackagePr
 			}
 		}
 	} else if context == -1 {
-		contextLine, _ := fileContext(file, line, 0)
+		contextLine, _ := sourceCodeLoader.Load(file, line, 0)
 		if len(contextLine) > 0 {
 			frame.ContextLine = string(contextLine[0])
 		}
@@ -118,12 +182,8 @@ func NewStacktraceFrame(pc uintptr, file string, line, context int, appPackagePr
 }
 
 // Retrieve the name of the package and function containing the PC.
-func functionName(pc uintptr) (pack string, name string) {
-	fn := runtime.FuncForPC(pc)
-	if fn == nil {
-		return
-	}
-	name = fn.Name()
+func functionName(fName string) (pack string, name string) {
+	name = fName
 	// We get this:
 	//	runtime/debug.*T·ptrmethod
 	// and want this:
@@ -137,21 +197,43 @@ func functionName(pc uintptr) (pack string, name string) {
 	return
 }
 
-var fileCacheLock sync.Mutex
-var fileCache = make(map[string][][]byte)
+type SourceCodeLoader interface {
+	Load(filename string, line, context int) ([][]byte, int)
+}
 
-func fileContext(filename string, line, context int) ([][]byte, int) {
-	fileCacheLock.Lock()
-	defer fileCacheLock.Unlock()
-	lines, ok := fileCache[filename]
+var sourceCodeLoader SourceCodeLoader = &fsLoader{cache: make(map[string][][]byte)}
+
+func SetSourceCodeLoader(loader SourceCodeLoader) {
+	sourceCodeLoader = loader
+}
+
+type fsLoader struct {
+	mu    sync.Mutex
+	cache map[string][][]byte
+}
+
+func (fs *fsLoader) Load(filename string, line, context int) ([][]byte, int) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	lines, ok := fs.cache[filename]
 	if !ok {
 		data, err := ioutil.ReadFile(filename)
 		if err != nil {
+			// cache errors as nil slice: code below handles it correctly
+			// otherwise when missing the source or running as a different user, we try
+			// reading the file on each error which is unnecessary
+			fs.cache[filename] = nil
 			return nil, 0
 		}
 		lines = bytes.Split(data, []byte{'\n'})
-		fileCache[filename] = lines
+		fs.cache[filename] = lines
 	}
+
+	if lines == nil {
+		// cached error from ReadFile: return no lines
+		return nil, 0
+	}
+
 	line-- // stack trace lines are 1-indexed
 	start := line - context
 	var idx int
@@ -176,10 +258,6 @@ var trimPaths []string
 // Try to trim the GOROOT or GOPATH prefix off of a filename
 func trimPath(filename string) string {
 	for _, prefix := range trimPaths {
-		if prefix[len(prefix)-1] != filepath.Separator {
-			prefix += string(filepath.Separator)
-		}
-
 		if trimmed := strings.TrimPrefix(filename, prefix); len(trimmed) < len(filename) {
 			return trimmed
 		}
@@ -188,5 +266,12 @@ func trimPath(filename string) string {
 }
 
 func init() {
-	trimPaths = build.Default.SrcDirs()
+	// Collect all source directories, and make sure they
+	// end in a trailing "separator"
+	for _, prefix := range build.Default.SrcDirs() {
+		if prefix[len(prefix)-1] != filepath.Separator {
+			prefix += string(filepath.Separator)
+		}
+		trimPaths = append(trimPaths, prefix)
+	}
 }

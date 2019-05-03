@@ -1,15 +1,14 @@
 package application
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"context"
-
-	"github.com/Sirupsen/logrus"
+	conv "github.com/cstockton/go-conv"
 	"github.com/gin-gonic/gin"
-	"github.com/thoas/gokvstores"
+
 	"github.com/thoas/picfit/config"
 	"github.com/thoas/picfit/engine"
 	"github.com/thoas/picfit/errs"
@@ -20,23 +19,17 @@ import (
 	"github.com/thoas/picfit/storage"
 )
 
-// LoadFromConfigContent returns a net/context from content
-func LoadFromConfigContent(content string) (context.Context, error) {
-	cfg, err := config.LoadFromContent(content)
+// Load returns a net/context from a config.Config instance
+func Load(cfg *config.Config) (context.Context, error) {
+	ctx := config.NewContext(context.Background(), *cfg)
 
+	log, err := logger.New(cfg.Logger)
 	if err != nil {
 		return nil, err
 	}
+	ctx = logger.NewContext(ctx, log)
 
-	return LoadFromConfig(cfg)
-}
-
-// LoadFromConfig returns a net/context from a config.Config instance
-func LoadFromConfig(cfg *config.Config) (context.Context, error) {
-	ctx := config.NewContext(context.Background(), *cfg)
-
-	sourceStorage, destinationStorage, err := storage.NewStoragesFromConfig(cfg)
-
+	sourceStorage, destinationStorage, err := storage.New(cfg.Storage)
 	if err != nil {
 		return nil, err
 	}
@@ -44,35 +37,20 @@ func LoadFromConfig(cfg *config.Config) (context.Context, error) {
 	ctx = storage.NewSourceContext(ctx, sourceStorage)
 	ctx = storage.NewDestinationContext(ctx, destinationStorage)
 
-	keystore, err := kvstore.NewKVStoreFromConfig(cfg)
-
+	keystore, err := kvstore.New(cfg.KVStore)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx = kvstore.NewContext(ctx, keystore)
 
-	e := &engine.GoImageEngine{
-		DefaultFormat:  cfg.Options.DefaultFormat,
-		Format:         cfg.Options.Format,
-		DefaultQuality: cfg.Options.Quality,
-	}
+	e := engine.New(*cfg.Engine)
+
+	log.Debugf("Image engine %s configured", e.String())
 
 	ctx = engine.NewContext(ctx, e)
-	ctx = logger.NewContext(ctx, logrus.New())
 
 	return ctx, nil
-}
-
-// Load creates a net/context from a file config path
-func Load(path string) (context.Context, error) {
-	cfg, err := config.Load(path)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return LoadFromConfig(cfg)
 }
 
 // Store stores an image file with the defined filepath
@@ -82,56 +60,35 @@ func Store(ctx context.Context, filepath string, i *image.ImageFile) error {
 	cfg := config.FromContext(ctx)
 
 	k := kvstore.FromContext(ctx)
-	con := k.Connection()
-	defer con.Close()
 
 	err := i.Save()
 
 	if err != nil {
-		l.Fatal(err)
 		return err
 	}
 
 	l.Infof("Save thumbnail %s to storage", i.Filepath)
 
-	prefix := cfg.KVStore.Prefix
-
-	storeKey := i.Key
-
-	key := i.Key
-
-	if prefix != "" {
-		storeKey = prefix + storeKey
-	}
-
-	err = con.Set(storeKey, i.Filepath)
+	err = k.Set(i.Key, i.Filepath)
 
 	if err != nil {
-		l.Fatal(err)
-
 		return err
 	}
 
-	l.Infof("Save key %s => %s to kvstore", storeKey, i.Filepath)
+	l.Infof("Save key %s => %s to kvstore", i.Key, i.Filepath)
 
 	// Write children info only when we actually want to be able to delete things.
 	if cfg.Options.EnableDelete {
 		parentKey := hash.Tokey(filepath)
 
-		if prefix != "" {
-			parentKey = prefix + parentKey
-		}
-
 		parentKey = fmt.Sprintf("%s:children", parentKey)
 
-		err = con.SetAdd(parentKey, storeKey)
-
+		err = k.AppendSlice(parentKey, i.Key)
 		if err != nil {
-			l.Fatal(err)
 			return err
 		}
 
-		l.Infof("Put key into set %s (%s) => %s in kvstore", parentKey, filepath, key)
+		l.Infof("Put key into set %s (%s) => %s in kvstore", parentKey, filepath, i.Key)
 	}
 
 	return nil
@@ -140,8 +97,6 @@ func Store(ctx context.Context, filepath string, i *image.ImageFile) error {
 // Delete removes a file from kvstore and storage
 func Delete(ctx context.Context, filepath string) error {
 	k := kvstore.FromContext(ctx)
-	con := k.Connection()
-	defer con.Close()
 
 	l := logger.FromContext(ctx)
 
@@ -163,22 +118,24 @@ func Delete(ctx context.Context, filepath string) error {
 
 	parentKey := hash.Tokey(filepath)
 
-	prefix := config.FromContext(ctx).KVStore.Prefix
-
-	if prefix != "" {
-		parentKey = prefix + parentKey
-	}
-
 	childrenKey := fmt.Sprintf("%s:children", parentKey)
 
-	if !con.Exists(childrenKey) {
+	exists, err := k.Exists(childrenKey)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
 		l.Infof("Children key %s does not exist for parent %s", childrenKey, parentKey)
 
 		return errs.ErrKeyNotExists
 	}
 
 	// Get the list of items to cleanup.
-	children := con.SetMembers(childrenKey)
+	children, err := k.GetSlice(childrenKey)
+	if err != nil {
+		return err
+	}
 
 	if children == nil {
 		l.Infof("No children to delete for %s", parentKey)
@@ -189,16 +146,19 @@ func Delete(ctx context.Context, filepath string) error {
 	store := storage.DestinationFromContext(ctx)
 
 	for _, s := range children {
-		key, err := gokvstores.String(s)
-
+		key, err := conv.String(s)
 		if err != nil {
 			return err
 		}
 
 		// Now, every child is a hash which points to a key/value pair in
 		// KVStore which in turn points to a file in dst storage.
-		dstfile, err := gokvstores.String(con.Get(key))
+		dstfileRaw, err := k.Get(key)
+		if err != nil {
+			return err
+		}
 
+		dstfile, err := conv.String(dstfileRaw)
 		if err != nil {
 			return err
 		}
@@ -210,7 +170,7 @@ func Delete(ctx context.Context, filepath string) error {
 			return err
 		}
 
-		err = con.Delete(key)
+		err = k.Delete(key)
 
 		if err != nil {
 			return err
@@ -222,7 +182,7 @@ func Delete(ctx context.Context, filepath string) error {
 	// Delete them right away, we don't care about them anymore.
 	l.Infof("Deleting children set %s", childrenKey)
 
-	err = con.Delete(childrenKey)
+	err = k.Delete(childrenKey)
 
 	if err != nil {
 		return err
@@ -233,118 +193,121 @@ func Delete(ctx context.Context, filepath string) error {
 
 // ImageFileFromContext generates an ImageFile from gin context
 func ImageFileFromContext(c *gin.Context, async bool, load bool) (*image.ImageFile, error) {
-	key := c.MustGet("key").(string)
+	storeKey := c.MustGet("key").(string)
 
 	k := kvstore.FromContext(c)
-	con := k.Connection()
-
-	cfg := config.FromContext(c)
-
 	l := logger.FromContext(c)
 
-	defer con.Close()
+	// Image from the KVStore found
+	imageKey, err := k.Get(storeKey)
+	if err != nil {
+		return nil, err
+	}
+
+	if imageKey != nil {
+		return fileFromStorage(c, l, storeKey, imageKey, load)
+	}
+
+	// Image not found from the KVStore, we need to process it
+	// URL available in Query String
+	l.Infof("Key %s not found in kvstore", storeKey)
+	return processImage(c, l, storeKey, async)
+}
+
+func fileFromStorage(c *gin.Context, l logger.Logger, storeKey string, imageKey interface{}, load bool) (*image.ImageFile, error) {
+	stored, err := conv.String(imageKey)
+	if err != nil {
+		return nil, err
+	}
+
+	l.Infof("Key %s found in kvstore: %s", storeKey, stored)
 
 	destStorage := storage.DestinationFromContext(c)
 
-	var file = &image.ImageFile{
-		Key:     key,
+	file := &image.ImageFile{
+		Key:      storeKey,
+		Storage:  destStorage,
+		Filepath: stored,
+		Headers:  map[string]string{},
+	}
+
+	if load {
+		file, err = image.FromStorage(destStorage, stored)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	file.Headers["ETag"] = storeKey
+	return file, nil
+}
+
+func processImage(c *gin.Context, l logger.Logger, storeKey string, async bool) (*image.ImageFile, error) {
+	cfg := config.FromContext(c)
+	destStorage := storage.DestinationFromContext(c)
+
+	file := &image.ImageFile{
+		Key:     storeKey,
 		Storage: destStorage,
 		Headers: map[string]string{},
 	}
-	var err error
+
 	var filepath string
+	qs := c.MustGet("parameters").(map[string]interface{})
 
-	prefix := cfg.KVStore.Prefix
+	var err error
+	s := storage.SourceFromContext(c)
 
-	storeKey := key
-
-	if prefix != "" {
-		storeKey = prefix + key
-	}
-
-	// Image from the KVStore found
-	stored, err := gokvstores.String(con.Get(storeKey))
-
-	file.Filepath = stored
-
-	if stored != "" {
-		l.Infof("Key %s found in kvstore: %s", storeKey, stored)
-
-		noneMatch := c.Request.Header.Get("If-None-Match")
-		if noneMatch == key {
-			return nil, errs.ErrClientHasImage
-		}
-
-		if load {
-			file, err = image.FromStorage(destStorage, stored)
-
-			if err != nil {
-				return nil, err
-			}
-		}
+	u, exists := c.Get("url")
+	if exists {
+		file, err = image.FromURL(u.(*url.URL), cfg.Options.DefaultUserAgent)
 	} else {
-		l.Infof("Key %s not found in kvstore", storeKey)
-
-		u, exists := c.Get("url")
-
-		parameters := c.MustGet("parameters").(map[string]string)
-
-		// Image not found from the KVStore, we need to process it
-		// URL available in Query String
-		if exists {
-			file, err = image.FromURL(u.(*url.URL))
-		} else {
-			// URL provided we use http protocol to retrieve it
-			s := storage.SourceFromContext(c)
-
-			filepath = parameters["path"]
-
-			if !s.Exists(filepath) {
-				return nil, errs.ErrFileNotExists
-			}
-
-			file, err = image.FromStorage(s, filepath)
+		// URL provided we use http protocol to retrieve it
+		filepath = qs["path"].(string)
+		if !s.Exists(filepath) {
+			return nil, errs.ErrFileNotExists
 		}
 
-		if err != nil {
-			return nil, err
-		}
-
-		op := c.MustGet("op").(*engine.Operation)
-
-		file, err = engine.FromContext(c).Transform(file, op, parameters)
-
-		if err != nil {
-			return nil, err
-		}
-
-		filename := ShardFilename(c, key)
-
-		file.Filepath = fmt.Sprintf("%s.%s", filename, file.Format())
+		file, err = image.FromStorage(s, filepath)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	file.Key = key
+	e := engine.FromContext(c)
+	parameters, err := NewParameters(e, s, file, qs)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err = e.Transform(parameters.Output, parameters.Operations)
+	if err != nil {
+		return nil, err
+	}
+
+	filename := ShardFilename(c, storeKey)
+	file.Filepath = fmt.Sprintf("%s.%s", filename, file.Format())
 	file.Storage = destStorage
+	file.Key = storeKey
+	file.Headers["ETag"] = storeKey
 
-	file.Headers["ETag"] = key
-	file.Headers["Cache-Control"] = fmt.Sprintf("max-age=%d, s-maxage=%d", cfg.CacheControl, cfg.CacheControl)
-
-	if stored == "" {
-		if async == true {
-			go Store(c, filepath, file)
-		} else {
-			err = Store(c, filepath, file)
+	if async == true {
+		go Store(c, filepath, file)
+	} else {
+		err = Store(c, filepath, file)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	return file, err
+	return file, nil
 }
 
 // ShardFilename shards a filename based on config
 func ShardFilename(ctx context.Context, filename string) string {
 	cfg := config.FromContext(ctx)
 
-	results := hash.Shard(filename, cfg.Shard.Width, cfg.Shard.Depth, true)
+	results := hash.Shard(filename, cfg.Shard.Width, cfg.Shard.Depth, cfg.Shard.RestOnly)
 
 	return strings.Join(results, "/")
 }

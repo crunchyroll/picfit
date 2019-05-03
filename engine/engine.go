@@ -1,21 +1,127 @@
 package engine
 
 import (
-	"github.com/disintegration/imaging"
+	"fmt"
+	"strings"
+
+	"github.com/thoas/picfit/engine/backend"
+	"github.com/thoas/picfit/engine/config"
 	"github.com/thoas/picfit/image"
 )
 
-type Options struct {
-	Upscale bool
-	Format  imaging.Format
-	Quality int
+type Engine struct {
+	DefaultFormat  string
+	Format         string
+	DefaultQuality int
+
+	backends  []backend.Backend
+	mimetypes map[string]backend.Backend
 }
 
-type Engine interface {
-	Resize(img *image.ImageFile, width int, height int, options *Options) ([]byte, error)
-	Thumbnail(img *image.ImageFile, width int, height int, options *Options) ([]byte, error)
-	Transform(img *image.ImageFile, operation *Operation, qs map[string]string) (*image.ImageFile, error)
-	Flip(img *image.ImageFile, pos string, options *Options) ([]byte, error)
-	Rotate(img *image.ImageFile, deg int, options *Options) ([]byte, error)
-	Fit(img *image.ImageFile, width int, height int, options *Options) ([]byte, error)
+// New initializes an Engine
+func New(cfg config.Config) *Engine {
+	var (
+		b         []backend.Backend
+		mimetypes = map[string]backend.Backend{}
+	)
+
+	if cfg.Backends == nil {
+		b = append(b, &backend.GoImage{})
+	} else {
+		if cfg.Backends.Lilliput != nil {
+			back := backend.NewLilliput(cfg)
+
+			b = append(b, back)
+
+			for _, mimetype := range cfg.Backends.Lilliput.Mimetypes {
+				mimetypes[mimetype] = back
+			}
+		}
+
+		if cfg.Backends.GoImage != nil {
+			back := &backend.GoImage{}
+
+			b = append(b, back)
+
+			for _, mimetype := range cfg.Backends.GoImage.Mimetypes {
+				mimetypes[mimetype] = back
+			}
+		}
+	}
+
+	quality := config.DefaultQuality
+	if cfg.Quality != 0 {
+		quality = cfg.Quality
+	}
+
+	return &Engine{
+		DefaultFormat:  cfg.DefaultFormat,
+		Format:         cfg.Format,
+		DefaultQuality: quality,
+		backends:       b,
+		mimetypes:      mimetypes,
+	}
+}
+
+func (e Engine) String() string {
+	backendNames := []string{}
+	for _, backend := range e.backends {
+		backendNames = append(backendNames, backend.String())
+	}
+
+	return strings.Join(backendNames, " ")
+}
+
+func (e Engine) Transform(output *image.ImageFile, operations []EngineOperation) (*image.ImageFile, error) {
+	var (
+		err       error
+		processed []byte
+		source    = output.Source
+	)
+
+	for i := range operations {
+		backends := e.backends
+
+		back, ok := e.mimetypes[output.ContentType()]
+		if ok {
+			backends = []backend.Backend{back}
+		}
+
+		for j := range backends {
+			processed, err = operate(backends[j], output, operations[i].Operation, operations[i].Options)
+			if err == nil {
+				output.Source = processed
+				break
+			}
+			if err != backend.MethodNotImplementedError {
+				return nil, err
+			}
+		}
+	}
+
+	output.Source = source
+	output.Processed = processed
+
+	return output, err
+}
+
+func operate(b backend.Backend, img *image.ImageFile, operation Operation, options *backend.Options) ([]byte, error) {
+	switch operation {
+	case Noop:
+		return img.Source, nil
+	case Flip:
+		return b.Flip(img, options)
+	case Rotate:
+		return b.Rotate(img, options)
+	case Resize:
+		return b.Resize(img, options)
+	case Thumbnail:
+		return b.Thumbnail(img, options)
+	case Fit:
+		return b.Fit(img, options)
+	case Flat:
+		return b.Flat(img, options)
+	default:
+		return nil, fmt.Errorf("Operation not found for %s", operation)
+	}
 }

@@ -4,19 +4,19 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/codegangsta/cli"
-	"github.com/thoas/picfit/application"
+	"github.com/thoas/picfit/constants"
 	"github.com/thoas/picfit/server"
 	"github.com/thoas/picfit/signature"
+	"github.com/urfave/cli"
 )
 
 func main() {
 	app := cli.NewApp()
 	app.Name = "picfit"
+	app.Version = fmt.Sprintf("%s [git:%s:%s]\ncompiled using %s at %s", constants.Version, constants.Branch, constants.Revision, constants.Compiler, constants.BuildTime)
 	app.Author = "thoas"
 	app.Email = "florent.messa@gmail.com"
 	app.Usage = "Display, manipulate, transform and cache your images"
-	app.Version = application.Version
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "config, c",
@@ -24,13 +24,14 @@ func main() {
 			EnvVar: "PICFIT_CONFIG_PATH",
 		},
 	}
+
 	app.Commands = []cli.Command{
 		{
 			Name:      "version",
 			ShortName: "v",
 			Usage:     "Retrieve the version number",
 			Action: func(c *cli.Context) {
-				fmt.Printf("picfit %s\n", application.Version)
+				fmt.Printf("picfit %s\n", constants.Version)
 			},
 		},
 		{
@@ -85,7 +86,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		err := server.Load(config)
+		err := server.Run(config)
 
 		if err != nil {
 			fmt.Fprint(os.Stderr, err)

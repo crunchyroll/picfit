@@ -2,13 +2,13 @@ package middleware
 
 import (
 	"fmt"
-	"mime"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+
 	"github.com/thoas/picfit/engine"
 	"github.com/thoas/picfit/hash"
 	"github.com/thoas/picfit/image"
@@ -27,7 +27,7 @@ func ParametersParser() gin.HandlerFunc {
 		if result != "" {
 			match := parametersReg.FindStringSubmatch(result)
 
-			parameters := make(map[string]string)
+			parameters := make(map[string]interface{})
 
 			for i, name := range parametersReg.SubexpNames() {
 				if i != 0 && match[i] != "" {
@@ -37,7 +37,7 @@ func ParametersParser() gin.HandlerFunc {
 
 			c.Set("parameters", parameters)
 		} else {
-			if c.Query("url") == "" {
+			if c.Query("url") == "" && c.Query("path") == "" {
 				c.String(http.StatusBadRequest, "Request should contains parameters or query string")
 				c.Abort()
 				return
@@ -51,22 +51,14 @@ func ParametersParser() gin.HandlerFunc {
 // KeyParser injects an unique key from query parameters
 func KeyParser() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var queryString map[string]string
+		queryString := make(map[string]interface{})
 
 		params, exists := c.Get("parameters")
-
 		if exists {
-			queryString = params.(map[string]string)
-		} else {
-			queryString = make(map[string]string)
+			queryString = params.(map[string]interface{})
 		}
 
-		for k, v := range c.Request.URL.Query() {
-			queryString[k] = v[0]
-		}
-
-		sorted := util.SortMapString(queryString)
-
+		sorted := setParamsFromURLValues(queryString, c.Request.URL.Query())
 		delete(sorted, sigParamName)
 
 		serialized := hash.Serialize(sorted)
@@ -80,8 +72,34 @@ func KeyParser() gin.HandlerFunc {
 	}
 }
 
+func setParamsFromURLValues(params map[string]interface{}, values url.Values) map[string]interface{} {
+	for k, v := range values {
+		if k != "op" {
+			params[k] = v[0]
+			continue
+		}
+
+		var operations []string
+		op, ok := params[k].(string)
+		if ok {
+			operations = append(operations, op)
+		}
+		operations = append(operations, v...)
+
+		if len(operations) > 1 {
+			params[k] = operations
+		} else if len(operations) == 1 {
+			params[k] = operations[0]
+		}
+	}
+
+	return util.SortMapString(params)
+}
+
 // URLParser extracts the url query string and add a url.URL to the context
-func URLParser() gin.HandlerFunc {
+func URLParser(mimetypeDetectorType string) gin.HandlerFunc {
+	mimetypeDetector := image.GetMimetypeDetector(mimetypeDetectorType)
+
 	return func(c *gin.Context) {
 		value := c.Query("url")
 
@@ -94,7 +112,7 @@ func URLParser() gin.HandlerFunc {
 				return
 			}
 
-			mimetype := mime.TypeByExtension(filepath.Ext(value))
+			mimetype, _ := mimetypeDetector(url)
 
 			_, ok := image.Extensions[mimetype]
 
@@ -105,6 +123,7 @@ func URLParser() gin.HandlerFunc {
 			}
 
 			c.Set("url", url)
+			c.Set("mimetype", mimetype)
 		}
 
 		c.Next()
@@ -114,26 +133,52 @@ func URLParser() gin.HandlerFunc {
 // OperationParser extracts the operation and add it to the context
 func OperationParser() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		parameters := c.MustGet("parameters").(map[string]string)
+		parameters := c.MustGet("parameters").(map[string]interface{})
 
-		operation, ok := parameters["op"]
+		operation, ok := parameters["op"].(string)
+		if ok && operation != "" {
+			if _, k := engine.Operations[operation]; !k {
+				c.String(http.StatusBadRequest, fmt.Sprintf("Invalid method %s or invalid parameters", operation))
+				c.Abort()
+				return
+			}
+			c.Set("op", operation)
+			c.Next()
+			return
+		}
 
-		if !ok {
+		operations, ok := parameters["op"].([]string)
+		if !ok || len(operations) == 0 {
 			c.String(http.StatusBadRequest, "`op` parameter or query string cannot be empty")
 			c.Abort()
 			return
 		}
 
-		op, ok := engine.Operations[operation]
+		for i := range operations {
+			_, ok := engine.Operations[operations[i]]
+			if !ok {
+				params := make(map[string]string)
+				for _, p := range strings.Split(operations[i], " ") {
+					l := strings.Split(p, ":")
+					if len(l) > 1 {
+						params[l[0]] = l[1]
+					}
+				}
 
-		if !ok {
-			c.String(http.StatusBadRequest, fmt.Sprintf("Invalid method %s or invalid parameters", operation))
-			c.Abort()
-			return
+				v, exists := params["op"]
+				if !exists {
+					c.String(http.StatusBadRequest, "`op` parameter or query string cannot be empty")
+					c.Abort()
+					return
+				} else if _, ok := engine.Operations[v]; !ok {
+					c.String(http.StatusBadRequest, fmt.Sprintf("Invalid method %s or invalid parameters", operations[i]))
+					c.Abort()
+					return
+				}
+			}
 		}
 
-		c.Set("op", op)
-
+		c.Set("op", operations)
 		c.Next()
 	}
 }

@@ -5,7 +5,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/thoas/gostorages"
+	"github.com/ulule/gostorages"
 )
 
 type ImageFile struct {
@@ -42,6 +42,9 @@ func (i *ImageFile) Format() string {
 }
 
 func (i *ImageFile) ContentType() string {
+	if _, ok := i.Headers["Content-Type"]; ok {
+		return i.Headers["Content-Type"]
+	}
 	return mime.TypeByExtension(i.FilenameExt())
 }
 
