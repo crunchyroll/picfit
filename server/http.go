@@ -119,6 +119,7 @@ func (s *HTTPServer) Init(opts Options) error {
 		views := []gin.HandlerFunc{
 			middleware.ParametersParser(),
 			middleware.KeyParser(),
+			middleware.TenantParser(),
 			middleware.Security(s.config.SecretKey),
 			middleware.URLParser(s.config.Options.MimetypeDetector),
 			middleware.OperationParser(),
